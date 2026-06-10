@@ -30,10 +30,7 @@ ACCESS_EXP_MIN = 60 * 24 * 7
 OTP_EXP_MIN = 5
 REFERRAL_CREDIT = 500.0  # ₹500 maintenance credit per successful referral
 
-client = AsyncIOMotorClient(
-    MONGO_URL,
-    tlsCAFile=certifi.where()
-)
+client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
 app = FastAPI(title="SocioHub API v2")
