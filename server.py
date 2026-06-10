@@ -703,7 +703,21 @@ async def guard_add_visitor(payload: VisitorIn, user=Depends(require_role("secur
     )
     return doc
 
+@app.post("/api/test-push/{user_id}")
+async def test_push(user_id: str):
 
+    user = await db.users.find_one({"id": user_id})
+
+    if not user:
+        return {"error": "User not found"}
+
+    await firebase_send_push(
+        user["fcm_token"],
+        "SocioHub Test",
+        "Hello Lav, Firebase is working!"
+    )
+
+    return {"success": True}
 @api.post("/guard/visitors/{vid}/checkin")
 async def guard_checkin(vid: str, user=Depends(require_role("security_guard"))):
     v = await db.visitors.find_one({"id": vid, "society_id": user["society_id"]}, {"_id": 0})
