@@ -1,23 +1,14 @@
 """Push notifications via Emergent-managed relay (SuprSend)."""
-import os
+
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
-import httpx
+from firebase_service import send_push
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from firebase_service import send_push
 
 log = logging.getLogger("sociohub.push")
-
-PUSH_BASE_URL = "https://integrations.emergentagent.com"
-PUSH_KEY = os.environ.get("EMERGENT_PUSH_KEY", "placeholder")
-
-_client = httpx.AsyncClient(
-    base_url=PUSH_BASE_URL,
-    headers={"X-Push-Key": PUSH_KEY},
-    timeout=10.0,
-)
 
 push_router = APIRouter(prefix="/api")
 
@@ -30,21 +21,22 @@ class RegisterPushBody(BaseModel):
     device_token: str
 
 
-@push_router.post("/register-push", status_code=201)
+@push_router.post("/register-push")
 async def register_push(body: RegisterPushBody):
-    try:
-        resp = await _client.post("/api/v1/push/users/register", json=body.model_dump())
-        if resp.status_code == 401:
-            raise HTTPException(500, "EMERGENT_PUSH_KEY missing or invalid")
-        if resp.status_code >= 500:
-            raise HTTPException(502, "Push provider unavailable")
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        log.warning(f"register_push upstream error: {e}")
-        # Don't fail the client — registration retried on next app open
-        return {"status": "deferred"}
-    return {"status": "registered"}
 
+    from server import db
+
+    await db.users.update_one(
+        {"id": body.user_id},
+        {
+            "$set": {
+                "fcm_token": body.device_token,
+                "platform": body.platform
+            }
+        }
+    )
+
+    return {"status": "registered"}
 
 def _is_quiet_hours(now: datetime | None = None) -> bool:
     now = (now or datetime.now(IST)).astimezone(IST)
@@ -115,7 +107,14 @@ async def push_to_user(
         data = {"title": title, "message": message}
         if action_url:
             data["action_url"] = action_url
-        await send_push([user["id"]], data, idempotency_key=idempotency_key)
+        token = user.get("fcm_token")
+
+if token:
+    await send_push(
+        token,
+        title,
+        message
+    )
     except Exception as e:
         log.warning(f"push_to_user failed (non-blocking): {e}")
 
@@ -138,7 +137,17 @@ async def push_to_users(
         if action_url:
             data["action_url"] = action_url
         # Chunk by 100
-        for i in range(0, len(eligible), 100):
-            await send_push(eligible[i:i + 100], data, idempotency_key=idempotency_key)
+        for u in users:
+
+            token = u.get("fcm_token")
+
+            if not token:
+                continue
+
+            await send_push(
+                token,
+                title,
+                message
+            )
     except Exception as e:
         log.warning(f"push_to_users failed (non-blocking): {e}")
