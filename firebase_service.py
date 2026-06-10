@@ -14,7 +14,7 @@ cred = credentials.Certificate(cred_dict)
 firebase_admin.initialize_app(cred)
 
 
-async def send_push(token, title, body):
+async def firebase_send_push(token, title, body):
 
     message = messaging.Message(
         notification=messaging.Notification(
