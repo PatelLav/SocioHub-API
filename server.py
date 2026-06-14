@@ -30,7 +30,10 @@ ACCESS_EXP_MIN = 60 * 24 * 7
 OTP_EXP_MIN = 5
 REFERRAL_CREDIT = 500.0  # ₹500 maintenance credit per successful referral
 
-client = AsyncIOMotorClient(MONGO_URL)
+client = AsyncIOMotorClient(
+    MONGO_URL,
+    tlsCAFile=certifi.where()
+)
 db = client[DB_NAME]
 
 app = FastAPI(title="SocioHub API v2")
@@ -53,7 +56,23 @@ def gen_ref_code(name: str) -> str:
     suffix = "".join(random.choices(string.digits, k=3))
     return f"{prefix}{suffix}"
 
+def gen_invite_code(name: str):
+    prefix = "".join(
+        c for c in name.upper()
+        if c.isalpha()
+    )[:4]
 
+    if not prefix:
+        prefix = "SOCI"
+
+    suffix = "".join(
+        random.choices(
+            string.digits,
+            k=3
+        )
+    )
+
+    return f"{prefix}{suffix}"
 # ---- Models ----
 class SignupIn(BaseModel):
     mobile: str = Field(..., min_length=10, max_length=15)
@@ -78,8 +97,8 @@ class UserOut(BaseModel):
     mobile: str
     name: str
     email: str
-    society_id: str
-    society_name: str
+    tenant_id: str
+    tenant_name: str
     flat_no: str
     tower: str
     role: str
@@ -94,8 +113,10 @@ class TokenOut(BaseModel):
 
 
 class VerifyOtpOut(BaseModel):
-    token: TokenOut
-    user: UserOut
+    is_registered: bool
+    token: Optional[TokenOut] = None
+    user: Optional[UserOut] = None
+    mobile: Optional[str] = None
 
 
 class VisitorIn(BaseModel):
@@ -135,8 +156,8 @@ class ResidentIn(BaseModel):
     mobile: str
     name: str
     email: EmailStr
-    flat_no: str
-    tower: str = "A"
+    tower_id: str
+    unit_id: str
 
 
 class ResidentUpdateIn(BaseModel):
@@ -154,6 +175,63 @@ class PreferencesIn(BaseModel):
     privacy: Optional[dict] = None
     notifications: Optional[dict] = None
 
+class SocietySearchOut(BaseModel):
+    id: str
+    name: str
+    city: Optional[str] = None
+
+
+class RegistrationRequestIn(BaseModel):
+    tenant_id: str
+    tower_id: str
+    unit_id: str
+
+    name: str
+    mobile: str
+    email: EmailStr
+
+    invite_code: str
+
+
+class RegistrationRequestActionIn(BaseModel):
+    reason: Optional[str] = None
+
+
+class TowerCreateIn(BaseModel):
+    tenant_id: str
+    name: str
+
+
+class UnitCreateIn(BaseModel):
+    tenant_id: str
+    tower_id: str
+    unit_no: str
+class TenantCreateIn(BaseModel):
+    name: str
+    address: str
+    city: str
+
+
+class RegistrationApproveOut(BaseModel):
+    success: bool
+    message: str
+class SocietyAdminCreateIn(BaseModel):
+    tenant_id: str
+    name: str
+    mobile: str
+    email: EmailStr
+class CreateSocietyAdminIn(BaseModel):
+    tenant_id: str
+    name: str
+    mobile: str
+    email: str
+
+class BulkUnitIn(BaseModel):
+    tenant_id: str
+    tower_id: str
+    prefix: str
+    start: int
+    end: int
 
 DEFAULT_PREFS = {
     "privacy": {
@@ -205,13 +283,33 @@ def require_role(*roles: str):
 
 
 async def user_to_out(user: dict) -> UserOut:
-    society = await db.societies.find_one({"id": user["society_id"]}, {"_id": 0})
+    tenant_id = user.get("tenant_id")
+
+    tenant_name = user.get("tenant_name")
+
+    if tenant_id and not tenant_name:
+        tenant = await db.tenants.find_one(
+            {"id": tenant_id},
+            {"_id": 0}
+        )
+
+        if tenant:
+            tenant_name = tenant["name"]
+
     return UserOut(
-        id=user["id"], mobile=user["mobile"], name=user["name"], email=user["email"],
-        society_id=user["society_id"],
-        society_name=society["name"] if society else "SocioHub",
-        flat_no=user.get("flat_no", ""), tower=user.get("tower", ""),
-        role=user.get("role", "resident"), avatar=user.get("avatar"),
+        id=user["id"],
+        mobile=user["mobile"],
+        name=user["name"],
+        email=user["email"],
+
+        tenant_id=tenant_id or "",
+        tenant_name=tenant_name or "",
+
+        flat_no=user.get("flat_no", ""),
+        tower=user.get("tower", ""),
+        role=user.get("role", "resident"),
+        avatar=user.get("avatar"),
+
         referral_code=user.get("referral_code"),
         referral_credit=user.get("referral_credit", 0.0),
     )
@@ -220,7 +318,7 @@ async def user_to_out(user: dict) -> UserOut:
 # ---- Auth Routes ----
 @api.post("/auth/signup")
 async def signup(payload: SignupIn):
-    society = await db.societies.find_one({}, {"_id": 0})
+    tenant = await db.tenants.find_one({}, {"_id": 0})
     existing = await db.users.find_one({"mobile": payload.mobile})
     if not existing:
         ref_code = gen_ref_code(payload.name)
@@ -229,7 +327,7 @@ async def signup(payload: SignupIn):
             ref_code = gen_ref_code(payload.name)
         user_doc = {
             "id": new_id(), "mobile": payload.mobile, "name": payload.name, "email": payload.email,
-            "society_id": society["id"], "flat_no": payload.flat_no, "tower": payload.tower,
+            "tenant_id": tenant["id"], "flat_no": payload.flat_no, "tower": payload.tower,
             "role": "resident", "is_active": False, "avatar": None,
             "referral_code": ref_code, "referred_by_code": payload.referral_code,
             "referral_credit": 0.0, "created_at": now_utc(),
@@ -258,37 +356,90 @@ async def signup(payload: SignupIn):
 
 @api.post("/auth/login")
 async def login(payload: LoginIn):
-    user = await db.users.find_one({"mobile": payload.mobile})
-    if not user:
-        raise HTTPException(404, "User not found. Please sign up.")
+
+    user = await db.users.find_one({
+        "mobile": payload.mobile
+    })
+
     code = f"{random.randint(0, 999999):06d}"
-    await db.otps.delete_many({"mobile": payload.mobile})
-    await db.otps.insert_one({"mobile": payload.mobile, "code": code,
-                              "expires_at": now_utc() + timedelta(minutes=OTP_EXP_MIN), "consumed": False})
-    log.info(f"[DEV] OTP for {payload.mobile} = {code}")
-    return {"message": "OTP sent", "dev_otp": code}
+
+    await db.otps.delete_many({
+        "mobile": payload.mobile
+    })
+
+    await db.otps.insert_one({
+        "mobile": payload.mobile,
+        "code": code,
+        "expires_at": now_utc() + timedelta(minutes=OTP_EXP_MIN),
+        "consumed": False
+    })
+
+    log.info(
+        f"[DEV] OTP for {payload.mobile} = {code}"
+    )
+
+    return {
+        "message": "OTP sent",
+        "dev_otp": code,
+        "is_registered": user is not None
+    }
 
 
 @api.post("/auth/verify-otp", response_model=VerifyOtpOut)
 async def verify_otp(payload: VerifyOtpIn):
-    rec = await db.otps.find_one({"mobile": payload.mobile, "consumed": False}, {"_id": 0})
+    rec = await db.otps.find_one(
+        {"mobile": payload.mobile, "consumed": False},
+        {"_id": 0}
+    )
+
     if not rec:
         raise HTTPException(400, "No OTP requested")
+
     exp = rec["expires_at"]
+
     if exp.tzinfo is None:
         exp = exp.replace(tzinfo=timezone.utc)
+
     if exp < now_utc():
         raise HTTPException(400, "OTP expired")
+
     if rec["code"] != payload.otp:
         raise HTTPException(400, "Invalid OTP")
-    await db.otps.update_many({"mobile": payload.mobile}, {"$set": {"consumed": True}})
-    user = await db.users.find_one({"mobile": payload.mobile}, {"_id": 0})
-    if not user.get("is_active"):
-        await db.users.update_one({"id": user["id"]}, {"$set": {"is_active": True}})
-        user["is_active"] = True
-    token = make_token(user["id"])
-    return VerifyOtpOut(token=TokenOut(access_token=token), user=await user_to_out(user))
 
+    await db.otps.update_many(
+        {"mobile": payload.mobile},
+        {"$set": {"consumed": True}}
+    )
+
+    user = await db.users.find_one(
+        {"mobile": payload.mobile},
+        {"_id": 0}
+    )
+
+    # User does not exist -> Registration flow
+    if not user:
+        return VerifyOtpOut(
+            is_registered=False,
+            mobile=payload.mobile
+        )
+
+    # Existing user
+    if not user.get("is_active"):
+        await db.users.update_one(
+            {"id": user["id"]},
+            {"$set": {"is_active": True}}
+        )
+        user["is_active"] = True
+
+    token = make_token(user["id"])
+
+    return VerifyOtpOut(
+        is_registered=True,
+        token=TokenOut(
+            access_token=token
+        ),
+        user=await user_to_out(user)
+    )
 
 @api.get("/auth/me", response_model=UserOut)
 async def me(user=Depends(get_current_user)):
@@ -322,7 +473,141 @@ async def update_preferences(payload: PreferencesIn, user=Depends(get_current_us
     await db.users.update_one({"id": user["id"]}, {"$set": {"preferences": new_prefs}})
     return new_prefs
 
+@api.get("/public/societies/search")
+async def search_societies(q: str):
 
+    return await db.tenants.find(
+        {
+            "status": "active",
+            "name": {
+                "$regex": q,
+                "$options": "i"
+            }
+        },
+        {
+            "_id": 0,
+            "id": 1,
+            "name": 1,
+            "city": 1
+        }
+    ).limit(20).to_list(20)
+@api.get("/public/societies/{tenant_id}/towers")
+async def get_towers(tenant_id: str):
+
+    return await db.towers.find(
+        {
+            "tenant_id": tenant_id
+        },
+        {
+            "_id": 0
+        }
+    ).sort("name", 1).to_list(100)
+@api.get("/public/towers/{tower_id}/units")
+async def get_units(tower_id: str):
+
+    return await db.units.find(
+        {
+            "tower_id": tower_id,
+            "occupancy_status": "available"
+        },
+        {
+            "_id": 0
+        }
+    ).sort("unit_no", 1).to_list(1000)
+@api.post("/public/register-request")
+async def register_request(
+    payload: RegistrationRequestIn
+):
+
+    tenant = await db.tenants.find_one(
+        {
+            "id": payload.tenant_id,
+            "status": "active"
+        }
+    )
+
+    if not tenant:
+        raise HTTPException(
+            404,
+            "Society not found"
+        )
+
+    if tenant["invite_code"] != payload.invite_code:
+        raise HTTPException(
+            400,
+            "Invalid invite code"
+        )
+
+    existing = await db.users.find_one(
+        {
+            "mobile": payload.mobile
+        }
+    )
+
+    if existing:
+        raise HTTPException(
+            400,
+            "Mobile already registered"
+        )
+
+    unit = await db.units.find_one(
+        {
+            "id": payload.unit_id,
+            "tower_id": payload.tower_id
+        }
+    )
+
+    if not unit:
+        raise HTTPException(
+            404,
+            "Unit not found"
+        )
+
+    if unit["occupancy_status"] != "available":
+        raise HTTPException(
+            400,
+            "Unit not available"
+        )
+
+    await db.units.update_one(
+        {
+            "id": payload.unit_id
+        },
+        {
+            "$set": {
+                "occupancy_status": "pending_approval"
+            }
+        }
+    )
+
+    await db.registration_requests.insert_one(
+        {
+            "id": new_id(),
+
+            "tenant_id": payload.tenant_id,
+
+            "tower_id": payload.tower_id,
+
+            "unit_id": payload.unit_id,
+
+            "name": payload.name,
+
+            "mobile": payload.mobile,
+
+            "email": payload.email,
+
+            "invite_code": payload.invite_code,
+
+            "status": "pending",
+
+            "created_at": now_utc()
+        }
+    )
+
+    return {
+        "success": True,
+        "message": "Request submitted"
+    }
 # ---- Resident Dashboard ----
 @api.get("/dashboard")
 async def dashboard(user=Depends(require_role("resident"))):
@@ -331,7 +616,7 @@ async def dashboard(user=Depends(require_role("resident"))):
     today = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
     visitors_today = await db.visitors.count_documents({"user_id": user["id"], "created_at": {"$gte": today}})
     pending_visitors = await db.visitors.count_documents({"user_id": user["id"], "status": "pending"})
-    recent_notices = await db.notices.find({"society_id": user["society_id"]}, {"_id": 0}).sort("created_at", -1).limit(3).to_list(3)
+    recent_notices = await db.notices.find({"tenant_id": user["tenant_id"]}, {"_id": 0}).sort("created_at", -1).limit(3).to_list(3)
     return {
         "pending_maintenance": pending_inv["amount"] if pending_inv else 0,
         "pending_invoice_id": pending_inv["id"] if pending_inv else None,
@@ -355,7 +640,7 @@ async def list_visitors(user=Depends(require_role("resident")), status_filter: O
 async def create_visitor(payload: VisitorIn, user=Depends(require_role("resident"))):
     is_expected = payload.expected_at is not None
     doc = {
-        "id": new_id(), "user_id": user["id"], "society_id": user["society_id"],
+        "id": new_id(), "user_id": user["id"], "tenant_id": user["tenant_id"],
         "flat_no": user["flat_no"], "tower": user.get("tower", "A"),
         "resident_name": user["name"],
         "name": payload.name, "mobile": payload.mobile, "purpose": payload.purpose,
@@ -389,7 +674,7 @@ async def create_complaint(payload: ComplaintIn, user=Depends(require_role("resi
     count = await db.complaints.count_documents({}) + 1
     n = now_utc()
     doc = {
-        "id": new_id(), "user_id": user["id"], "society_id": user["society_id"],
+        "id": new_id(), "user_id": user["id"], "tenant_id": user["tenant_id"],
         "ticket_no": f"SH-{count:05d}", "resident_name": user["name"], "flat_no": user["flat_no"],
         "category": payload.category, "description": payload.description, "priority": payload.priority,
         "image_base64": payload.image_base64, "status": "open", "assigned_to": None,
@@ -404,7 +689,7 @@ async def create_complaint(payload: ComplaintIn, user=Depends(require_role("resi
 # ---- Notices (shared read, admin create) ----
 @api.get("/notices")
 async def list_notices(user=Depends(get_current_user), category: Optional[str] = None):
-    q = {"society_id": user["society_id"]}
+    q = {"tenant_id": user["tenant_id"]}
     if category and category != "all":
         q["category"] = category
     docs = await db.notices.find(q, {"_id": 0}).sort("created_at", -1).to_list(100)
@@ -491,27 +776,606 @@ async def my_referrals(user=Depends(require_role("resident"))):
         "referrals": items,
     }
 
+# ============================================================
+# SUPER ADMIN ROUTES
+# ============================================================
+@api.post("/super-admin/tenant")
+async def create_tenant(
+    payload: TenantCreateIn,
+    user=Depends(require_role("super_admin"))
+):
+    invite_code = gen_invite_code(
+        payload.name
+    )
 
+    while await db.tenants.find_one(
+        {
+            "invite_code": invite_code
+        }
+    ):
+        invite_code = gen_invite_code(
+            payload.name
+        )
+
+    tenant = {
+        "id": new_id(),
+        "name": payload.name,
+        "address": payload.address,
+        "city": payload.city,
+        "invite_code": invite_code,
+        "status": "active",
+        "created_at": now_utc()
+    }
+
+    await db.tenants.insert_one(
+        tenant
+    )
+
+    return {
+        "id": tenant["id"],
+        "name": tenant["name"],
+        "address": tenant["address"],
+        "city": tenant["city"],
+        "invite_code": tenant["invite_code"],
+        "status": tenant["status"]
+    }
+
+@api.post("/super-admin/tower")
+async def create_tower(
+    payload: TowerCreateIn,
+    user=Depends(require_role("super_admin"))
+):
+
+    tower = {
+        "id": new_id(),
+        "tenant_id": payload.tenant_id,
+        "name": payload.name,
+        "created_at": now_utc()
+    }
+
+    await db.towers.insert_one(tower)
+
+    return {
+        "id": tower["id"],
+        "tenant_id": tower["tenant_id"],
+        "name": tower["name"]
+    }
+
+
+@api.post("/super-admin/unit")
+async def create_unit(
+    payload: UnitCreateIn,
+    user=Depends(require_role("super_admin"))
+):
+
+    unit = {
+        "id": new_id(),
+        "tenant_id": payload.tenant_id,
+        "tower_id": payload.tower_id,
+        "unit_no": payload.unit_no,
+
+        "occupancy_status": "available",
+
+        "owner_user_id": None,
+        "current_resident_user_id": None,
+
+        "created_at": now_utc()
+    }
+
+    await db.units.insert_one(unit)
+
+    return {
+    "id": unit["id"],
+    "tenant_id": unit["tenant_id"],
+    "tower_id": unit["tower_id"],
+    "unit_no": unit["unit_no"],
+    "occupancy_status": unit["occupancy_status"]
+}
+
+@api.get("/super-admin/tenants")
+async def get_tenants(
+    user=Depends(require_role("super_admin"))
+):
+    tenants = await db.tenants.find(
+        {},
+        {"_id": 0}
+    ).sort(
+        "created_at",
+        -1
+    ).to_list(None)
+
+    return tenants
+
+@api.post("/super-admin/society-admin")
+async def create_society_admin(
+    payload: CreateSocietyAdminIn,
+    user=Depends(require_role("super_admin"))
+):
+    tenant = await db.tenants.find_one(
+        {"id": payload.tenant_id}
+    )
+
+    if not tenant:
+        raise HTTPException(
+            404,
+            "Society not found"
+        )
+
+    existing = await db.users.find_one({
+        "mobile": payload.mobile
+    })
+
+    if existing:
+        raise HTTPException(
+            400,
+            "Mobile already registered"
+        )
+
+    admin = {
+        "id": new_id(),
+        "tenant_id": payload.tenant_id,
+        "mobile": payload.mobile,
+        "name": payload.name,
+        "email": payload.email,
+        "role": "society_admin",
+        "is_active": True,
+        "created_at": now_utc()
+    }
+
+    await db.users.insert_one(admin)
+
+    admin.pop("_id", None)
+
+    return admin
+
+@api.get(
+    "/super-admin/tenant/{tenant_id}/admin"
+)
+async def get_society_admin(
+    tenant_id: str,
+    user=Depends(require_role("super_admin"))
+):
+    admin = await db.users.find_one(
+        {
+            "tenant_id": tenant_id,
+            "role": "society_admin"
+        },
+        {"_id": 0}
+    )
+
+    if not admin:
+        raise HTTPException(
+            404,
+            "Admin not found"
+        )
+
+    return admin
+
+@api.get(
+    "/super-admin/tenant/{tenant_id}/towers"
+)
+async def get_towers(
+    tenant_id: str,
+    user=Depends(require_role("super_admin"))
+):
+    towers = await db.towers.find(
+        {
+            "tenant_id": tenant_id
+        },
+        {"_id": 0}
+    ).sort(
+        "created_at",
+        1
+    ).to_list(None)
+
+    return towers
+
+@api.get(
+    "/super-admin/tower/{tower_id}/units"
+)
+async def get_units(
+    tower_id: str,
+    user=Depends(require_role("super_admin"))
+):
+    units = await db.units.find(
+        {
+            "tower_id": tower_id
+        },
+        {"_id": 0}
+    ).sort(
+        "unit_no",
+        1
+    ).to_list(None)
+
+    return units
+
+@api.get("/super-admin/dashboard")
+async def super_admin_dashboard(
+    user=Depends(require_role("super_admin"))
+):
+    societies = await db.tenants.count_documents({})
+
+    residents = await db.users.count_documents(
+        {"role": "resident"}
+    )
+
+    pending_requests = await db.registration_requests.count_documents(
+        {"status": "pending"}
+    )
+
+    complaints = await db.complaints.count_documents(
+        {}
+    )
+
+    return {
+        "societies": societies,
+        "residents": residents,
+        "pending_requests": pending_requests,
+        "complaints": complaints,
+    }
 # ============================================================
 # ADMIN ROUTES
 # ============================================================
+@api.get("/admin/registration-requests")
+async def pending_registration_requests(
+    user=Depends(require_role("society_admin"))
+):
+
+    return await db.registration_requests.find(
+        {
+            "tenant_id": user["tenant_id"],
+            "status": "pending"
+        },
+        {
+            "_id": 0
+        }
+    ).to_list(1000)
+
+
+@api.post("/admin/registration-requests/{rid}/approve")
+async def approve_request(
+    rid: str,
+    user=Depends(require_role("society_admin"))
+):
+
+    req = await db.registration_requests.find_one(
+        {
+            "id": rid,
+            "status": "pending"
+        }
+    )
+
+    if not req:
+        raise HTTPException(
+            404,
+            "Request not found"
+        )
+
+    resident_id = new_id()
+    tower = await db.towers.find_one(
+        {"id": req["tower_id"]},
+        {"_id": 0}
+    )
+
+    unit = await db.units.find_one(
+        {"id": req["unit_id"]},
+        {"_id": 0}
+    )
+    await db.users.insert_one(
+    {
+        "id": resident_id,
+        "tenant_id":
+            req["tenant_id"],
+        "tower_id":
+            req["tower_id"],
+        "tower":
+            tower["name"],
+        "unit_id":
+            req["unit_id"],
+        "flat_no":
+            unit['unit_no'],
+        "name":
+            req["name"],
+        "mobile":
+            req["mobile"],
+        "email":
+            req["email"],
+        "role":
+            "resident",
+        "is_active":
+            True,
+        "created_at":
+            now_utc()
+    }
+)
+
+    await db.units.update_one(
+        {
+            "id": req["unit_id"]
+        },
+        {
+            "$set": {
+                "occupancy_status": "occupied",
+                "current_resident_user_id": resident_id
+            }
+        }
+    )
+
+    await db.registration_requests.update_one(
+        {
+            "id": rid
+        },
+        {
+            "$set": {
+                "status": "approved",
+                "approved_at": now_utc()
+            }
+        }
+    )
+
+    return {
+        "success": True
+    }
+
+
+@api.post("/admin/registration-requests/{rid}/reject")
+async def reject_request(
+    rid: str,
+    payload: RegistrationRequestActionIn,
+    user=Depends(require_role("society_admin"))
+):
+
+    req = await db.registration_requests.find_one(
+        {
+            "id": rid,
+            "status": "pending"
+        }
+    )
+
+    if not req:
+        raise HTTPException(
+            404,
+            "Request not found"
+        )
+
+    await db.units.update_one(
+        {
+            "id": req["unit_id"]
+        },
+        {
+            "$set": {
+                "occupancy_status": "available"
+            }
+        }
+    )
+
+    await db.registration_requests.update_one(
+        {
+            "id": rid
+        },
+        {
+            "$set": {
+                "status": "rejected",
+                "reason": payload.reason,
+                "rejected_at": now_utc()
+            }
+        }
+    )
+
+    return {
+        "success": True
+    }
+@api.post(
+    "/super-admin/units/bulk"
+)
+async def bulk_create_units(
+    payload: BulkUnitIn,
+    user=Depends(require_role("super_admin"))
+):
+    if payload.start > payload.end:
+        raise HTTPException(
+            400,
+            "Invalid range"
+        )
+
+    tower = await db.towers.find_one(
+        {
+            "id": payload.tower_id
+        }
+    )
+
+    if not tower:
+        raise HTTPException(
+            404,
+            "Tower not found"
+        )
+
+    units = []
+
+    for i in range(
+        payload.start,
+        payload.end + 1
+    ):
+        unit_no = f"{payload.prefix}-{i}"
+
+        exists = await db.units.find_one(
+            {
+                "tower_id": payload.tower_id,
+                "unit_no": unit_no
+            }
+        )
+
+        if exists:
+            continue
+
+        units.append({
+            "id": new_id(),
+            "tenant_id":
+                payload.tenant_id,
+            "tower_id":
+                payload.tower_id,
+            "unit_no":
+                unit_no,
+            "occupancy_status":
+                "available",
+            "created_at":
+                now_utc()
+        })
+
+    if units:
+        await db.units.insert_many(
+            units
+        )
+
+    return {
+        "count": len(units)
+    }
+
+@api.get(
+    "/super-admin/dashboard"
+)
+async def super_admin_dashboard(
+    user=Depends(require_role("super_admin"))
+):
+    societies = await db.tenants.count_documents({})
+    residents = await db.users.count_documents(
+        {
+            "role": "resident"
+        }
+    )
+
+    pending_requests = await db.registration_requests.count_documents(
+        {
+            "status": "pending"
+        }
+    )
+
+    complaints = await db.complaints.count_documents(
+        {}
+    )
+
+    return {
+        "societies": societies,
+        "residents": residents,
+        "pending_requests":
+            pending_requests,
+        "complaints":
+            complaints
+    }
+@api.delete(
+    "/super-admin/unit/{unit_id}"
+)
+async def delete_unit(
+    unit_id: str,
+    user=Depends(require_role("super_admin"))
+):
+    await db.units.delete_one(
+        {
+            "id": unit_id
+        }
+    )
+
+    return {
+        "message":
+            "Unit deleted"
+    }
+@api.delete(
+    "/super-admin/tower/{tower_id}"
+)
+async def delete_tower(
+    tower_id: str,
+    user=Depends(require_role("super_admin"))
+):
+    await db.units.delete_many(
+        {
+            "tower_id":
+                tower_id
+        }
+    )
+
+    await db.towers.delete_one(
+        {
+            "id": tower_id
+        }
+    )
+
+    return {
+        "message":
+            "Tower deleted"
+    }
+@api.delete(
+    "/super-admin/tenant/{tenant_id}"
+)
+async def delete_tenant(
+    tenant_id: str,
+    user=Depends(require_role("super_admin"))
+):
+    await db.units.delete_many(
+        {
+            "tenant_id":
+                tenant_id
+        }
+    )
+
+    await db.towers.delete_many(
+        {
+            "tenant_id":
+                tenant_id
+        }
+    )
+
+    await db.users.delete_many(
+        {
+            "tenant_id":
+                tenant_id
+        }
+    )
+
+    await db.registration_requests.delete_many(
+        {
+            "tenant_id":
+                tenant_id
+        }
+    )
+
+    await db.tenants.delete_one(
+        {
+            "id": tenant_id
+        }
+    )
+
+    return {
+        "message":
+            "Society deleted"
+    }
+
 @api.get("/admin/dashboard")
 async def admin_dashboard(user=Depends(require_role("society_admin"))):
-    sid = user["society_id"]
-    total_residents = await db.users.count_documents({"society_id": sid, "role": "resident"})
-    total_complaints = await db.complaints.count_documents({"society_id": sid})
-    open_complaints = await db.complaints.count_documents({"society_id": sid, "status": {"$in": ["open", "in_progress"]}})
+    sid = user["tenant_id"]
+    total_residents = await db.users.count_documents({"tenant_id": sid, "role": "resident"})
+    total_complaints = await db.complaints.count_documents({"tenant_id": sid})
+    open_complaints = await db.complaints.count_documents({"tenant_id": sid, "status": {"$in": ["open", "in_progress"]}})
     today = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
-    visitors_today = await db.visitors.count_documents({"society_id": sid, "created_at": {"$gte": today}})
+    visitors_today = await db.visitors.count_documents({"tenant_id": sid, "created_at": {"$gte": today}})
     paid = await db.invoices.aggregate([
-        {"$match": {"status": "paid"}},
+        {
+    "$match": {
+        "tenant_id": sid,
+        "status": "paid"
+    }
+},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
     ]).to_list(1)
     pending = await db.invoices.aggregate([
-        {"$match": {"status": "pending"}},
+        {
+    "$match": {
+        "tenant_id": sid,
+        "status": "pending"
+    }
+},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
     ]).to_list(1)
-    recent_complaints = await db.complaints.find({"society_id": sid}, {"_id": 0}).sort("created_at", -1).limit(5).to_list(5)
+    recent_complaints = await db.complaints.find({"tenant_id": sid}, {"_id": 0}).sort("created_at", -1).limit(5).to_list(5)
     return {
         "total_residents": total_residents,
         "open_complaints": open_complaints,
@@ -525,7 +1389,7 @@ async def admin_dashboard(user=Depends(require_role("society_admin"))):
 
 @api.get("/admin/residents")
 async def admin_list_residents(user=Depends(require_role("society_admin")), search: Optional[str] = None):
-    q = {"society_id": user["society_id"], "role": "resident"}
+    q = {"tenant_id": user["tenant_id"], "role": "resident"}
     if search:
         q["$or"] = [
             {"name": {"$regex": search, "$options": "i"}},
@@ -535,53 +1399,189 @@ async def admin_list_residents(user=Depends(require_role("society_admin")), sear
     items = await db.users.find(q, {"_id": 0, "is_active": 0}).sort("flat_no", 1).to_list(500)
     return items
 
-
 @api.post("/admin/residents")
-async def admin_add_resident(payload: ResidentIn, user=Depends(require_role("society_admin"))):
-    existing = await db.users.find_one({"mobile": payload.mobile})
+async def admin_add_resident(
+    payload: ResidentIn,
+    user=Depends(require_role("society_admin"))
+):
+    existing = await db.users.find_one(
+        {"mobile": payload.mobile}
+    )
+
     if existing:
-        raise HTTPException(400, "User with this mobile already exists")
-    ref_code = gen_ref_code(payload.name)
-    while await db.users.find_one({"referral_code": ref_code}):
-        ref_code = gen_ref_code(payload.name)
+        raise HTTPException(
+            400,
+            "User with this mobile already exists"
+        )
+
+    tower = await db.towers.find_one(
+        {
+            "id": payload.tower_id,
+            "tenant_id": user["tenant_id"]
+        }
+    )
+
+    if not tower:
+        raise HTTPException(
+            404,
+            "Tower not found"
+        )
+
+    unit = await db.units.find_one(
+        {
+            "id": payload.unit_id,
+            "tower_id": payload.tower_id
+        }
+    )
+
+    if not unit:
+        raise HTTPException(
+            404,
+            "Unit not found"
+        )
+
+    if unit["occupancy_status"] != "available":
+        raise HTTPException(
+            400,
+            "Unit already occupied"
+        )
+
+    resident_id = new_id()
+
+    ref_code = gen_ref_code(
+        payload.name
+    )
+
+    while await db.users.find_one(
+        {
+            "referral_code":
+                ref_code
+        }
+    ):
+        ref_code = gen_ref_code(
+            payload.name
+        )
+
     doc = {
-        "id": new_id(), "mobile": payload.mobile, "name": payload.name, "email": payload.email,
-        "society_id": user["society_id"], "flat_no": payload.flat_no, "tower": payload.tower,
-        "role": "resident", "is_active": True, "avatar": None,
-        "referral_code": ref_code, "referred_by_code": None, "referral_credit": 0.0,
+        "id": resident_id,
+
+        "mobile": payload.mobile,
+        "name": payload.name,
+        "email": payload.email,
+
+        "tenant_id": user["tenant_id"],
+
+        "tower_id": payload.tower_id,
+        "tower": tower["name"],
+
+        "unit_id": payload.unit_id,
+        "flat_no":
+            unit['unit_no'],
+
+        "role": "resident",
+        "is_active": True,
+
+        "avatar": None,
+
+        "referral_code": ref_code,
+        "referred_by_code": None,
+        "referral_credit": 0.0,
+
         "created_at": now_utc(),
     }
+
     await db.users.insert_one(doc)
-    await seed_user_invoices(doc["id"])
-    doc.pop("_id", None); doc.pop("is_active", None)
+
+    await db.units.update_one(
+        {
+            "id": payload.unit_id
+        },
+        {
+            "$set": {
+                "occupancy_status":
+                    "occupied",
+                "current_resident_user_id":
+                    resident_id
+            }
+        }
+    )
+
+    doc.pop("_id", None)
+
     return doc
 
 
 @api.patch("/admin/residents/{rid}")
 async def admin_update_resident(rid: str, payload: ResidentUpdateIn, user=Depends(require_role("society_admin"))):
     upd = {k: v for k, v in payload.dict().items() if v is not None}
-    res = await db.users.update_one({"id": rid, "society_id": user["society_id"], "role": "resident"}, {"$set": upd})
+    res = await db.users.update_one({"id": rid, "tenant_id": user["tenant_id"], "role": "resident"}, {"$set": upd})
     if res.matched_count == 0:
         raise HTTPException(404, "Resident not found")
     return {"ok": True}
 
 
-@api.delete("/admin/residents/{rid}")
-async def admin_delete_resident(rid: str, user=Depends(require_role("society_admin"))):
-    res = await db.users.delete_one({"id": rid, "society_id": user["society_id"], "role": "resident"})
-    if res.deleted_count == 0:
-        raise HTTPException(404, "Resident not found")
-    return {"ok": True}
+@api.delete(
+    "/admin/residents/{rid}"
+)
+async def admin_delete_resident(
+    rid: str,
+    user=Depends(
+        require_role(
+            "society_admin"
+        )
+    )
+):
+    resident = await db.users.find_one(
+        {
+            "id": rid,
+            "tenant_id":
+                user["tenant_id"],
+            "role":
+                "resident"
+        }
+    )
 
+    if not resident:
+        raise HTTPException(
+            404,
+            "Resident not found"
+        )
+
+    if resident.get("unit_id"):
+        await db.units.update_one(
+            {
+                "id":
+                    resident["unit_id"]
+            },
+            {
+                "$set":
+                {
+                    "occupancy_status":
+                        "available",
+                    "current_resident_user_id":
+                        None
+                }
+            }
+        )
+
+    await db.users.delete_one(
+        {
+            "id": rid
+        }
+    )
+
+    return {
+        "ok": True
+    }
 
 @api.get("/admin/complaints")
 async def admin_list_complaints(user=Depends(require_role("society_admin"))):
-    return await db.complaints.find({"society_id": user["society_id"]}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return await db.complaints.find({"tenant_id": user["tenant_id"]}, {"_id": 0}).sort("created_at", -1).to_list(500)
 
 
 @api.patch("/admin/complaints/{cid}")
 async def admin_update_complaint(cid: str, payload: ComplaintUpdateIn, user=Depends(require_role("society_admin"))):
-    c = await db.complaints.find_one({"id": cid, "society_id": user["society_id"]}, {"_id": 0})
+    c = await db.complaints.find_one({"id": cid, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not c:
         raise HTTPException(404, "Complaint not found")
     upd = {}
@@ -617,7 +1617,7 @@ async def admin_update_complaint(cid: str, payload: ComplaintUpdateIn, user=Depe
 @api.post("/admin/notices")
 async def admin_create_notice(payload: NoticeIn, user=Depends(require_role("society_admin"))):
     doc = {
-        "id": new_id(), "society_id": user["society_id"],
+        "id": new_id(), "tenant_id": user["tenant_id"],
         "title": payload.title, "body": payload.body, "category": payload.category,
         "created_at": now_utc(), "created_by": user["name"],
     }
@@ -625,7 +1625,7 @@ async def admin_create_notice(payload: NoticeIn, user=Depends(require_role("soci
     doc.pop("_id", None)
     # Push to all residents in society — emergencies are urgent
     residents = await db.users.find(
-        {"society_id": user["society_id"], "role": "resident"},
+        {"tenant_id": user["tenant_id"], "role": "resident"},
         {"_id": 0},
     ).to_list(2000)
     await push_to_users(
@@ -642,21 +1642,65 @@ async def admin_create_notice(payload: NoticeIn, user=Depends(require_role("soci
 
 @api.delete("/admin/notices/{nid}")
 async def admin_delete_notice(nid: str, user=Depends(require_role("society_admin"))):
-    await db.notices.delete_one({"id": nid, "society_id": user["society_id"]})
+    await db.notices.delete_one({"id": nid, "tenant_id": user["tenant_id"]})
     return {"ok": True}
+@api.get("/admin/towers")
+async def admin_towers(
+    user=Depends(
+        require_role("society_admin")
+    )
+):
+    return await db.towers.find(
+        {
+            "tenant_id":
+                user["tenant_id"]
+        },
+        {
+            "_id": 0
+        }
+    ).sort(
+        "name",
+        1
+    ).to_list(None)
 
+@api.get(
+    "/admin/towers/{tower_id}/units"
+)
+async def admin_units(
+    tower_id: str,
+    user=Depends(
+        require_role(
+            "society_admin"
+        )
+    )
+):
+    return await db.units.find(
+        {
+            "tower_id":
+                tower_id,
+
+            "occupancy_status":
+                "available"
+        },
+        {
+            "_id": 0
+        }
+    ).sort(
+        "unit_no",
+        1
+    ).to_list(None)
 
 # ============================================================
 # GUARD ROUTES
 # ============================================================
 @api.get("/guard/dashboard")
 async def guard_dashboard(user=Depends(require_role("security_guard"))):
-    sid = user["society_id"]
+    sid = user["tenant_id"]
     today = now_utc().replace(hour=0, minute=0, second=0, microsecond=0)
-    visitors_today = await db.visitors.count_documents({"society_id": sid, "created_at": {"$gte": today}})
-    expected = await db.visitors.count_documents({"society_id": sid, "status": "expected"})
-    pending_approval = await db.visitors.count_documents({"society_id": sid, "status": "pending"})
-    checked_in = await db.visitors.count_documents({"society_id": sid, "status": "checked_in"})
+    visitors_today = await db.visitors.count_documents({"tenant_id": sid, "created_at": {"$gte": today}})
+    expected = await db.visitors.count_documents({"tenant_id": sid, "status": "expected"})
+    pending_approval = await db.visitors.count_documents({"tenant_id": sid, "status": "pending"})
+    checked_in = await db.visitors.count_documents({"tenant_id": sid, "status": "checked_in"})
     return {
         "visitors_today": visitors_today,
         "expected": expected,
@@ -667,7 +1711,7 @@ async def guard_dashboard(user=Depends(require_role("security_guard"))):
 
 @api.get("/guard/visitors")
 async def guard_visitors(user=Depends(require_role("security_guard")), status_filter: Optional[str] = None):
-    q = {"society_id": user["society_id"]}
+    q = {"tenant_id": user["tenant_id"]}
     if status_filter and status_filter != "all":
         q["status"] = status_filter
     return await db.visitors.find(q, {"_id": 0}).sort("created_at", -1).limit(200).to_list(200)
@@ -677,11 +1721,11 @@ async def guard_visitors(user=Depends(require_role("security_guard")), status_fi
 async def guard_add_visitor(payload: VisitorIn, user=Depends(require_role("security_guard"))):
     if not payload.flat_no:
         raise HTTPException(400, "flat_no required")
-    resident = await db.users.find_one({"society_id": user["society_id"], "flat_no": payload.flat_no, "role": "resident"})
+    resident = await db.users.find_one({"tenant_id": user["tenant_id"], "flat_no": payload.flat_no, "role": "resident"})
     if not resident:
         raise HTTPException(404, f"No resident at flat {payload.flat_no}")
     doc = {
-        "id": new_id(), "user_id": resident["id"], "society_id": user["society_id"],
+        "id": new_id(), "user_id": resident["id"], "tenant_id": user["tenant_id"],
         "flat_no": payload.flat_no, "tower": resident.get("tower", "A"),
         "resident_name": resident["name"],
         "name": payload.name, "mobile": payload.mobile, "purpose": payload.purpose,
@@ -703,24 +1747,10 @@ async def guard_add_visitor(payload: VisitorIn, user=Depends(require_role("secur
     )
     return doc
 
-@app.post("/api/test-push/{user_id}")
-async def test_push(user_id: str):
 
-    user = await db.users.find_one({"id": user_id})
-
-    if not user:
-        return {"error": "User not found"}
-
-    await firebase_send_push(
-        user["fcm_token"],
-        "SocioHub Test",
-        "Hello Lav, Firebase is working!"
-    )
-
-    return {"success": True}
 @api.post("/guard/visitors/{vid}/checkin")
 async def guard_checkin(vid: str, user=Depends(require_role("security_guard"))):
-    v = await db.visitors.find_one({"id": vid, "society_id": user["society_id"]}, {"_id": 0})
+    v = await db.visitors.find_one({"id": vid, "tenant_id": user["tenant_id"]}, {"_id": 0})
     if not v:
         raise HTTPException(404, "Visitor not found")
     if v["status"] not in ("approved", "expected"):
@@ -732,7 +1762,7 @@ async def guard_checkin(vid: str, user=Depends(require_role("security_guard"))):
 @api.post("/guard/visitors/{vid}/checkout")
 async def guard_checkout(vid: str, user=Depends(require_role("security_guard"))):
     await db.visitors.update_one(
-        {"id": vid, "society_id": user["society_id"]},
+        {"id": vid, "tenant_id": user["tenant_id"]},
         {"$set": {"status": "checked_out", "checked_out_at": now_utc()}})
     return {"ok": True}
 
@@ -758,68 +1788,33 @@ async def seed_user_invoices(user_id: str):
 
 
 async def seed():
-    if await db.societies.count_documents({}) > 0:
-        # ensure demo admin & guard exist even if society already seeded
-        await ensure_demo_users()
-        return
-    society_id = new_id()
-    await db.societies.insert_one({
-        "id": society_id, "name": "Green Valley Heights",
-        "address": "Sector 21, Pune, India", "tenant_id": new_id(), "created_at": now_utc(),
-    })
-    notices_seed = [
-        ("Diwali Celebrations", "Join us for the annual Diwali festival on Nov 12 at the clubhouse.", "events"),
-        ("Water Tank Cleaning", "Water supply will be off on Saturday 9 AM - 1 PM.", "maintenance"),
-        ("Society AGM Notice", "AGM is scheduled for the last Sunday of this month.", "general"),
-        ("Lift Maintenance", "Tower A lift will undergo maintenance this weekend.", "maintenance"),
-        ("Fire Safety Drill", "Mandatory fire safety drill on Sunday at 7 AM.", "emergency"),
-    ]
-    for title, body, cat in notices_seed:
-        await db.notices.insert_one({
-            "id": new_id(), "society_id": society_id, "title": title, "body": body,
-            "category": cat, "created_at": now_utc() - timedelta(days=random.randint(0, 10)),
-        })
-    log.info(f"Seeded society {society_id}")
-    await ensure_demo_users()
-
-
-async def ensure_demo_users():
-    society = await db.societies.find_one({}, {"_id": 0})
-    sid = society["id"]
-
-    # Backfill missing referral_code on any existing users
-    async for u in db.users.find({"$or": [{"referral_code": {"$exists": False}}, {"referral_code": None}]}, {"_id": 0}):
-        ref = gen_ref_code(u.get("name", "USER"))
-        while await db.users.find_one({"referral_code": ref}):
-            ref = gen_ref_code(u.get("name", "USER"))
-        await db.users.update_one({"id": u["id"]}, {"$set": {"referral_code": ref, "referral_credit": u.get("referral_credit", 0.0)}})
-
-    async def make_user(mobile, name, email, role, flat="", tower=""):
-        existing = await db.users.find_one({"mobile": mobile})
-        if existing:
-            # ensure role correct
-            if existing.get("role") != role:
-                await db.users.update_one({"mobile": mobile}, {"$set": {"role": role}})
-            return existing
-        ref_code = gen_ref_code(name)
-        while await db.users.find_one({"referral_code": ref_code}):
-            ref_code = gen_ref_code(name)
-        doc = {
-            "id": new_id(), "mobile": mobile, "name": name, "email": email,
-            "society_id": sid, "flat_no": flat, "tower": tower, "role": role,
-            "is_active": True, "avatar": None, "referral_code": ref_code,
-            "referred_by_code": None, "referral_credit": 0.0, "created_at": now_utc(),
+    existing = await db.users.find_one(
+        {
+            "mobile": "9999999999",
+            "role": "super_admin"
         }
-        await db.users.insert_one(doc)
-        return doc
+    )
 
-    resident = await make_user("9876500001", "Asha Verma", "asha@test.com", "resident", "1204", "A")
-    await make_user("9876500002", "Vikram Singh", "admin@test.com", "society_admin", "", "")
-    await make_user("9876500003", "Ramesh Kumar", "guard@test.com", "security_guard", "", "")
-    await seed_user_invoices(resident["id"])
-    log.info("Demo users ensured (resident/admin/guard)")
+    if existing:
+        return
 
+    super_admin = {
+        "id": new_id(),
+        "mobile": "9999999999",
+        "name": "SocioHub Admin",
+        "email": "admin@sociohub.com",
+        "role": "super_admin",
+        "is_active": True,
+        "created_at": now_utc()
+    }
 
+    await db.users.insert_one(
+        super_admin
+    )
+
+    log.info(
+        "Super Admin seeded successfully"
+    )
 @app.on_event("startup")
 async def startup():
     await seed()
